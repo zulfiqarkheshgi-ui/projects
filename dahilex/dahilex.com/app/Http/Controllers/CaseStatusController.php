@@ -1,0 +1,189 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\CaseStatus;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Inertia\Inertia;
+
+class CaseStatusController extends Controller
+{
+    public function index(Request $request)
+    {
+        if (!Auth::user()->can('manage-case-statuses')) {
+            return redirect()->back()->with('error', __('Permission Denied.'));
+        }
+        $query = CaseStatus::with(['creator'])->where(function ($q) {
+            if (Auth::user()->can('manage-any-case-statuses')) {
+                $q->whereIn('created_by', getCompanyAndUsersId());
+            } elseif (Auth::user()->can('manage-own-case-statuses')) {
+                $q->where('created_by', Auth::id());
+            } else {
+                $q->whereRaw('1 = 0');
+            }
+        });
+
+        if ($request->has('search') && !empty($request->search)) {
+            $query->where(function ($q) use ($request) {
+                $q->where('name', 'like', '%' . $request->search . '%')
+                    ->orWhere('description', 'like', '%' . $request->search . '%');
+            });
+        }
+
+        if ($request->filled('status') && $request->status !== '_empty_') {
+            $allowedStatuses = ['active', 'inactive'];
+            if (in_array($request->status, $allowedStatuses)) {
+                $query->where('status', $request->status);
+            }
+        }
+
+        $allowedSortFields = ['name', 'created_at'];
+        $sortField = $request->input('sort_field', 'created_at');
+        $sortDirection = $request->input('sort_direction', 'desc');
+
+        if (!in_array($sortField, $allowedSortFields)) {
+            $sortField = 'created_at';
+        }
+
+        $sortDirection = in_array($sortDirection, ['asc', 'desc']) ? $sortDirection : 'desc';
+
+        $query->orderBy($sortField, $sortDirection);
+
+        $perPage = $request->input('per_page', 10);
+        if (!is_numeric($perPage) || $perPage < 1 || $perPage > 100) {
+            $perPage = 10;
+        }
+
+        $caseStatuses = $query->paginate($perPage)->withQueryString();
+
+        return Inertia::render('cases/case-statuses/index', [
+            'caseStatuses' => $caseStatuses,
+            'filters' => $request->only(['search', 'status', 'sort_field', 'sort_direction', 'per_page', 'page']),
+        ]);
+    }
+
+    public function store(Request $request)
+    {
+        if (!Auth::user()->can('create-case-statuses')) {
+            return redirect()->back()->with('error', __('Permission Denied.'));
+        }
+        $validated = $request->validate([
+            'name' => 'required|string|max:255',
+            'description' => 'nullable|string',
+            'color' => 'nullable|string|max:7',
+            'is_default' => 'nullable|boolean',
+            'is_closed' => 'nullable|boolean',
+            'status' => 'nullable|in:active,inactive',
+        ]);
+
+        $validated['created_by'] = auth()->id();
+        $validated['status'] = $validated['status'] ?? 'active';
+        $validated['color'] = $validated['color'] ?? '#10b77f';
+        $validated['is_default'] = $validated['is_default'] ?? false;
+        $validated['is_closed'] = $validated['is_closed'] ?? false;
+
+        $exists = CaseStatus::where('name', $validated['name'])
+            ->whereIn('created_by', getCompanyAndUsersId())
+            ->exists();
+
+        if ($exists) {
+            return redirect()->back()->with('error', 'Case status with this name already exists.');
+        }
+
+        // If setting as default, remove default from others
+        if ($validated['is_default']) {
+            CaseStatus::where('created_by', createdBy())->update(['is_default' => false]);
+        }
+
+        CaseStatus::create($validated);
+
+        return redirect()->back()->with('success', 'Case status created successfully.');
+    }
+
+    public function update(Request $request, $caseStatusId)
+    {
+        if (!Auth::user()->can('edit-case-statuses')) {
+            return redirect()->back()->with('error', __('Permission Denied.'));
+        }
+        $caseStatus = CaseStatus::where('id', $caseStatusId)
+            ->whereIn('created_by', getCompanyAndUsersId())
+            ->first();
+
+        if (!$caseStatus) {
+            return redirect()->back()->with('error', 'Case status not found.');
+        }
+
+        $validated = $request->validate([
+            'name' => 'required|string|max:255',
+            'description' => 'nullable|string',
+            'color' => 'nullable|string|max:7',
+            'is_default' => 'nullable|boolean',
+            'is_closed' => 'nullable|boolean',
+            'status' => 'nullable|in:active,inactive',
+        ]);
+
+        $validated['color'] = $validated['color'] ?? '#10b77f';
+        $validated['is_default'] = $validated['is_default'] ?? false;
+        $validated['is_closed'] = $validated['is_closed'] ?? false;
+
+        $exists = CaseStatus::where('name', $validated['name'])
+            ->whereIn('created_by', getCompanyAndUsersId())
+            ->where('id', '!=', $caseStatusId)
+            ->exists();
+
+        if ($exists) {
+            return redirect()->back()->with('error', 'Case status with this name already exists.');
+        }
+
+        // If setting as default, remove default from others
+        if ($validated['is_default']) {
+            CaseStatus::where('created_by', createdBy())->where('id', '!=', $caseStatusId)->update(['is_default' => false]);
+        }
+
+        $caseStatus->update($validated);
+
+        return redirect()->back()->with('success', 'Case status updated successfully.');
+    }
+
+    public function destroy($caseStatusId)
+    {
+        if (!Auth::user()->can('delete-case-statuses')) {
+            return redirect()->back()->with('error', __('Permission Denied.'));
+        }
+        $caseStatus = CaseStatus::where('id', $caseStatusId)
+            ->whereIn('created_by', getCompanyAndUsersId())
+            ->first();
+
+        if (!$caseStatus) {
+            return redirect()->back()->with('error', 'Case status not found.');
+        }
+
+        if ($caseStatus->cases()->count() > 0) {
+            return redirect()->back()->with('error', 'Cannot delete case status that has associated cases.');
+        }
+
+        $caseStatus->delete();
+
+        return redirect()->back()->with('success', 'Case status deleted successfully.');
+    }
+
+    public function toggleStatus($caseStatusId)
+    {
+        if (!Auth::user()->can('toggle-status-case-statuses')) {
+            return redirect()->back()->with('error', __('Permission Denied.'));
+        }
+        $caseStatus = CaseStatus::where('id', $caseStatusId)
+            ->whereIn('created_by', getCompanyAndUsersId())
+            ->first();
+
+        if (!$caseStatus) {
+            return redirect()->back()->with('error', 'Case status not found.');
+        }
+
+        $caseStatus->status = $caseStatus->status === 'active' ? 'inactive' : 'active';
+        $caseStatus->save();
+
+        return redirect()->back()->with('success', 'Case status updated successfully.');
+    }
+}
